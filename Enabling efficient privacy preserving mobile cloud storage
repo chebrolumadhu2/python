@@ -1,0 +1,160 @@
+# secure_cloud.py
+import os
+import json
+import math
+import hashlib
+import hmac
+import boto3
+from botocore.exceptions import ClientError
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.backends import default_backend
+
+# ---- Configurable parameters ----
+CHUNK_SIZE = 256 * 1024   # 256 KB per chunk (tune for mobile/network)
+KDF_ITERS = 200_000
+
+# ---- Key derivation ----
+def derive_key_from_password(password: str, salt: bytes, length: int = 32):
+    """Derive a symmetric key from password using PBKDF2-HMAC-SHA256."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=length,
+        salt=salt,
+        iterations=KDF_ITERS,
+        backend=default_backend()
+    )
+    return kdf.derive(password.encode('utf-8'))
+
+# ---- Deterministic token for keyword indexing (HMAC-SHA256) ----
+def keyword_token(master_key: bytes, keyword: str) -> str:
+    """Return hex token for keyword. Deterministic — reveals frequency patterns."""
+    return hmac.new(master_key, keyword.encode('utf-8'), hashlib.sha256).hexdigest()
+
+# ---- Chunk encrypt / decrypt ----
+def encrypt_chunk(key: bytes, plaintext: bytes, associated_data: bytes = None) -> bytes:
+    aesgcm = AESGCM(key)
+    # 12 byte nonce recommended for GCM
+    nonce = os.urandom(12)
+    ct = aesgcm.encrypt(nonce, plaintext, associated_data)
+    # store as nonce || ciphertext (nonce fixed length 12)
+    return nonce + ct
+
+def decrypt_chunk(key: bytes, blob: bytes, associated_data: bytes = None) -> bytes:
+    aesgcm = AESGCM(key)
+    nonce = blob[:12]
+    ct = blob[12:]
+    return aesgcm.decrypt(nonce, ct, associated_data)
+
+# ---- File -> chunked encrypted upload (S3 example) ----
+def encrypt_and_upload_file(s3_client, bucket_name: str, object_prefix: str,
+                            file_path: str, file_master_key: bytes,
+                            index_update_callback=None):
+    """
+    Break file into chunks, encrypt each chunk, upload as separate objects:
+      object key: {object_prefix}/{basename}.chunk.{i}
+    Optionally call index_update_callback(keyword_tokens, object_keys) to update remote index.
+    """
+    basename = os.path.basename(file_path)
+    object_keys = []
+    with open(file_path, 'rb') as f:
+        i = 0
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            # associated_data binds file metadata (filename + chunk index)
+            aad = f"{basename}:{i}".encode('utf-8')
+            enc = encrypt_chunk(file_master_key, chunk, associated_data=aad)
+            key_name = f"{object_prefix}/{basename}.chunk.{i}"
+            # upload bytes - boto3 accepts file-like; use put_object for small pieces
+            s3_client.put_object(Bucket=bucket_name, Key=key_name, Body=enc)
+            object_keys.append(key_name)
+            i += 1
+
+    # Return list of object keys representing the file (useful to store encrypted manifest)
+    if index_update_callback:
+        index_update_callback(basename, object_keys)
+    return object_keys
+
+def download_and_decrypt_file(s3_client, bucket_name: str, object_keys: list,
+                              out_path: str, file_master_key: bytes):
+    """Download each encrypted chunk and reconstruct file."""
+    with open(out_path, 'wb') as out:
+        for i, key in enumerate(object_keys):
+            resp = s3_client.get_object(Bucket=bucket_name, Key=key)
+            enc = resp['Body'].read()
+            aad = f"{os.path.basename(key).split('.chunk.')[0].split('/')[-1]}:{i}".encode('utf-8')
+            plain = decrypt_chunk(file_master_key, enc, associated_data=aad)
+            out.write(plain)
+
+# ---- Example index update (simple HMAC-based keyword index stored as JSON) ----
+def simple_index_update(s3_client, bucket_name: str, index_key: str,
+                        master_key_for_index: bytes, filename: str, object_keys: list, keywords: list):
+    """
+    - Downloads JSON index at index_key (if exists).
+    - For each keyword, computes deterministic token and appends object reference.
+    - Writes back encrypted index object (we store the index encrypted too).
+    NOTE: This is *not* a formal SSE scheme; it's a practical starting point.
+    """
+    # try fetch existing index
+    try:
+        existing = s3_client.get_object(Bucket=bucket_name, Key=index_key)
+        enc_index_blob = existing['Body'].read()
+        index_json = decrypt_chunk(master_key_for_index, enc_index_blob)
+        index = json.loads(index_json.decode('utf-8'))
+    except ClientError:
+        index = {}  # new index
+
+    for kw in keywords:
+        tok = keyword_token(master_key_for_index, kw)
+        index.setdefault(tok, [])
+        index[tok].append({
+            "filename": filename,
+            "chunks": object_keys
+        })
+
+    # encrypt and upload index
+    new_index_blob = json.dumps(index).encode('utf-8')
+    enc = encrypt_chunk(master_key_for_index, new_index_blob, associated_data=b"index")
+    s3_client.put_object(Bucket=bucket_name, Key=index_key, Body=enc)
+
+# ---- Example search by keyword (returns file manifests) ----
+def simple_search_index(s3_client, bucket_name: str, index_key: str,
+                        master_key_for_index: bytes, keyword: str):
+    try:
+        resp = s3_client.get_object(Bucket=bucket_name, Key=index_key)
+        enc = resp['Body'].read()
+        index_json = decrypt_chunk(master_key_for_index, enc, associated_data=b"index")
+        index = json.loads(index_json.decode('utf-8'))
+    except ClientError:
+        return []
+
+    tok = keyword_token(master_key_for_index, keyword)
+    return index.get(tok, [])
+
+# ---- Usage example (not for production credentials!) ----
+if __name__ == "__main__":
+    # Prepare keys -- in practice store these in secure storage or KMS
+    password = "user-chosen-password"
+    salt = os.urandom(16)
+    file_key = derive_key_from_password(password, salt)
+    index_key = derive_key_from_password(password + "-idx", salt)  # or separate secret
+
+    # init s3 client (make sure AWS credentials are set as env vars or via role)
+    s3 = boto3.client('s3')
+
+    BUCKET = "your-bucket"
+    PREFIX = "secure_uploads"
+    INDEX_KEY = f"{PREFIX}/index.enc"
+
+    # simple upload
+    files = encrypt_and_upload_file(s3, BUCKET, PREFIX, "local_photo.jpg", file_key,
+                                    index_update_callback=lambda fn, keys:
+                                        simple_index_update(s3, BUCKET, INDEX_KEY, index_key, fn, keys, keywords=["vacation", "beach"])
+                                   )
+
+    # search
+    hits = simple_search_index(s3, BUCKET, INDEX_KEY, index_key, "beach")
+    print("Search hits:", hits)
