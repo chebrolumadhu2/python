@@ -1,0 +1,39 @@
+import RPi.GPIO as GPIO
+import time
+
+# GPIO Mode
+GPIO.setmode(GPIO.BCM)
+
+TRIG = 23
+ECHO = 24
+
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+
+def distance():
+    # Set trigger to HIGH
+    GPIO.output(TRIG, True)
+
+    # Wait 10 microseconds
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    # Save start and stop times
+    StartTime = time.time()
+    StopTime = time.time()
+
+    # Store start time
+    while GPIO.input(ECHO) == 0:
+        StartTime = time.time()
+
+    # Store arrival time
+    while GPIO.input(ECHO) == 1:
+        StopTime = time.time()
+
+    # Time difference
+    TimeElapsed = StopTime - StartTime
+
+    # Distance = (TimeElapsed * Speed of Sound) / 2
+    distance = (TimeElapsed * 34300) / 2
+
+    return d
